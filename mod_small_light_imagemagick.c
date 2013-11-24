@@ -5,6 +5,10 @@
 #include "mod_small_light.h"
 #include "mod_small_light_ext_jpeg.h"
 
+#ifdef ENABLE_WEBP
+#include <webp/encode.h>
+#endif
+
 small_light_filter_prototype(imagemagick);
 
 #ifndef ENABLE_WAND
