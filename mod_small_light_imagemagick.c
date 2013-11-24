@@ -276,17 +276,55 @@ apr_status_t small_light_filter_imagemagick_output_data(
         MagickSetImageCompressionQuality(lctx->wand, q);
     }
     char *of = (char *)apr_table_get(ctx->prm, "of");
+#ifdef ENABLE_WEBP
+    int is_webp = (strcmp(of, "webp") == 0);
+    if (is_webp) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "MagickSetFormat(wand, '%s')", "rgba");
+        MagickSetFormat(lctx->wand, "rgba");
+    } else {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "MagickSetFormat(wand, '%s')", of);
+        MagickSetFormat(lctx->wand, of);
+    }
+#else
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
         "MagickSetFormat(wand, '%s')", of);
     MagickSetFormat(lctx->wand, of);
+#endif
 
     // get small_lighted image as binary.
     unsigned char *canvas_buff;
     const char *sled_image;
     size_t sled_image_size;
     canvas_buff = MagickGetImageBlob(lctx->wand, &sled_image_size);
+#ifdef ENABLE_WEBP
+    if (is_webp) {
+        // convert to WebP image
+        unsigned char *webp_buff = NULL;
+        size_t webp_size;
+        int stride = sled_image_size / (int)sz.dh;
+        webp_size = WebPEncodeRGBA(canvas_buff, (int)sz.dw, (int)sz.dh, stride, q, &webp_buff);
+        if (webp_size == 0) {
+            MagickRelinquishMemory(canvas_buff);
+            small_light_filter_imagemagick_output_data_fini(ctx);
+            ap_log_rerror(
+                APLOG_MARK, APLOG_ERR, 0, r,
+                "WebPEncodeRGBA(buf, %d, %d, %d, %lf, buf) failed",
+                (int)sz.dw, (int)sz.dh, stride, q
+            );
+            r->status = HTTP_INTERNAL_SERVER_ERROR;
+            return APR_EGENERAL;
+        }
+        sled_image = (const char *)apr_pmemdup(r->pool, webp_buff, webp_size);
+        sled_image_size = webp_size;
+        free(webp_buff);
+    } else {
+        sled_image = (const char *)apr_pmemdup(r->pool, canvas_buff, sled_image_size);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sled_image_size = %zd", sled_image_size);
+    }
+#else
     sled_image = (const char *)apr_pmemdup(r->pool, canvas_buff, sled_image_size);
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sled_image_size = %zd", sled_image_size);
+#endif
 
     // free buffer and wand.
     MagickRelinquishMemory(canvas_buff);
