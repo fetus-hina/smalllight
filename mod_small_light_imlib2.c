@@ -11,6 +11,9 @@
 #include "jpeglib.h"
 #include <setjmp.h>
 #endif
+#ifdef ENABLE_WEBP
+#include <webp/encode.h>
+#endif
 
 small_light_filter_prototype(imlib2);
 
@@ -515,69 +518,116 @@ apr_status_t small_light_filter_imlib2_output_data(
         imlib_image_attach_data_value("quality", NULL, q, NULL);
     }
     char *of = (char *)apr_table_get(ctx->prm, "of");
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-        "imlib_image_set_format('%s')", of);
-    imlib_image_set_format(of);
+#ifdef ENABLE_WEBP
+    if (strcmp(of, "webp") == 0) {
+        const int width  = imlib_image_get_width();
+        const int height = imlib_image_get_height();
+        const DATA32 *raw32 = imlib_image_get_data_for_reading_only();
+        unsigned char *rgba = apr_palloc(r->pool, width * height * 4);
+        int x, y;
+        for (y = 0; y < height; ++y) {
+            for (x = 0; x < width; ++x) {
+                const size_t index = y * width + x;
+                const DATA32 color = raw32[index];
+                rgba[index * 4 + 0] = (color & 0x00ff0000) >> 16;
+                rgba[index * 4 + 1] = (color & 0x0000ff00) >>  8;
+                rgba[index * 4 + 2] = (color & 0x000000ff);
+                rgba[index * 4 + 3] = (color & 0xff000000) >> 24;
+            }
+        }
+        unsigned char *webp = NULL;
+        size_t webp_size = WebPEncodeRGBA(rgba, width, height, width * 4, q, &webp);
+        if (webp_size == 0) {
+            ap_log_rerror(
+                    APLOG_MARK, APLOG_ERR, 0, r,
+                    "WebPEncodeRGBA(buf, %d, %d, %d, %lf, buf) failed",
+                    width, height, width * 4, q
+            );
+            r->status = HTTP_INTERNAL_SERVER_ERROR;
+            return APR_EGENERAL;
+        }
 
-    // save image.
-    char *sled_image_filename;
-    apr_file_t *sled_image_fp = NULL;
-    rv = apr_filepath_merge(&sled_image_filename, lctx->temp_dir, temp_file_template, APR_FILEPATH_TRUENAME, r->pool);
-    if (rv == APR_SUCCESS) {
-        rv = apr_file_mktemp(&sled_image_fp, sled_image_filename, 0, r->pool);
-    }
-    if (rv != APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "could not create temporary file.");
-        r->status = HTTP_INTERNAL_SERVER_ERROR;
-        return APR_EGENERAL;
-    }
-    Imlib_Load_Error err;
-    imlib_save_image_with_error_return(sled_image_filename, &err);
-    imlib_free_image();
+        const char *sled_image = (const char *)apr_pmemdup(r->pool, webp, webp_size);
+        free(webp);
 
-    // check error.
-    if (err != IMLIB_LOAD_ERROR_NONE) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "imlib_save_error failed. uri=%s", r->uri);
-        r->status = HTTP_INTERNAL_SERVER_ERROR;
-        return APR_EGENERAL;
-    }
-
-    // get small_lighted image by mmap.
-    apr_finfo_t sled_image_finfo;
-    apr_mmap_t *sled_image_mmap = NULL;
-    rv = apr_file_info_get(&sled_image_finfo, APR_FINFO_SIZE, sled_image_fp);
-    if (rv == APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sled_image_finfo.size = %d", (int)sled_image_finfo.size);
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "open mmap");
-        // open mmap.
-        // note that the mmap to be deleted automatically by apr, so we don't need to delete it manualy.
-        rv = apr_mmap_create(&sled_image_mmap, sled_image_fp, 0, sled_image_finfo.size, APR_MMAP_READ, r->pool);
-    }
-    if (rv != APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "open mmap failed. %s", r->uri);
-        r->status = HTTP_INTERNAL_SERVER_ERROR;
-        return APR_EGENERAL;
-    }
-    
-    // insert new backet.
-    if (exif_size > 0 && exif_data) {
-        // insert new bucket to bucket brigade with exif if exists.
-        exif_brigade_insert_tail(exif_data, exif_size, sled_image_mmap->mm, sled_image_finfo.size, r, ctx->bb);
-        apr_bucket *b = apr_bucket_pool_create(sled_image_mmap->mm + 2, sled_image_finfo.size - 2, r->pool, ctx->bb->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(ctx->bb, b);
-    } else {
         // insert new bucket to bucket brigade.
-        apr_bucket *b = apr_bucket_pool_create(sled_image_mmap->mm, sled_image_finfo.size, r->pool, ctx->bb->bucket_alloc);
+        apr_bucket *b = apr_bucket_pool_create(sled_image, webp_size, r->pool, ctx->bb->bucket_alloc);
         APR_BRIGADE_INSERT_TAIL(ctx->bb, b);
-    }
-    
-    // insert eos to bucket brigade.
-    APR_BRIGADE_INSERT_TAIL(ctx->bb, apr_bucket_eos_create(ctx->bb->bucket_alloc));
 
-    // set correct Content-Type and Content-Length.
-    char *cont_type = apr_psprintf(r->pool, "image/%s", of);
-    ap_set_content_type(r, cont_type);
-    ap_set_content_length(r, sled_image_finfo.size);
+        // insert eos to bucket brigade.
+        APR_BRIGADE_INSERT_TAIL(ctx->bb, apr_bucket_eos_create(ctx->bb->bucket_alloc));
+
+        // set correct Content-Type and Content-Length.
+        char *cont_type = apr_psprintf(r->pool, "image/%s", of);
+        ap_set_content_type(r, cont_type);
+        ap_set_content_length(r, webp_size);
+    } else {
+#else
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+            "imlib_image_set_format('%s')", of);
+        imlib_image_set_format(of);
+
+        // save image.
+        char *sled_image_filename;
+        apr_file_t *sled_image_fp = NULL;
+        rv = apr_filepath_merge(&sled_image_filename, lctx->temp_dir, temp_file_template, APR_FILEPATH_TRUENAME, r->pool);
+        if (rv == APR_SUCCESS) {
+            rv = apr_file_mktemp(&sled_image_fp, sled_image_filename, 0, r->pool);
+        }
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "could not create temporary file.");
+            r->status = HTTP_INTERNAL_SERVER_ERROR;
+            return APR_EGENERAL;
+        }
+        Imlib_Load_Error err;
+        imlib_save_image_with_error_return(sled_image_filename, &err);
+        imlib_free_image();
+
+        // check error.
+        if (err != IMLIB_LOAD_ERROR_NONE) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "imlib_save_error failed. uri=%s", r->uri);
+            r->status = HTTP_INTERNAL_SERVER_ERROR;
+            return APR_EGENERAL;
+        }
+
+        // get small_lighted image by mmap.
+        apr_finfo_t sled_image_finfo;
+        apr_mmap_t *sled_image_mmap = NULL;
+        rv = apr_file_info_get(&sled_image_finfo, APR_FINFO_SIZE, sled_image_fp);
+        if (rv == APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sled_image_finfo.size = %d", (int)sled_image_finfo.size);
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "open mmap");
+            // open mmap.
+            // note that the mmap to be deleted automatically by apr, so we don't need to delete it manualy.
+            rv = apr_mmap_create(&sled_image_mmap, sled_image_fp, 0, sled_image_finfo.size, APR_MMAP_READ, r->pool);
+        }
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "open mmap failed. %s", r->uri);
+            r->status = HTTP_INTERNAL_SERVER_ERROR;
+            return APR_EGENERAL;
+        }
+        
+        // insert new backet.
+        if (exif_size > 0 && exif_data) {
+            // insert new bucket to bucket brigade with exif if exists.
+            exif_brigade_insert_tail(exif_data, exif_size, sled_image_mmap->mm, sled_image_finfo.size, r, ctx->bb);
+            apr_bucket *b = apr_bucket_pool_create(sled_image_mmap->mm + 2, sled_image_finfo.size - 2, r->pool, ctx->bb->bucket_alloc);
+            APR_BRIGADE_INSERT_TAIL(ctx->bb, b);
+        } else {
+            // insert new bucket to bucket brigade.
+            apr_bucket *b = apr_bucket_pool_create(sled_image_mmap->mm, sled_image_finfo.size, r->pool, ctx->bb->bucket_alloc);
+            APR_BRIGADE_INSERT_TAIL(ctx->bb, b);
+        }
+        
+        // insert eos to bucket brigade.
+        APR_BRIGADE_INSERT_TAIL(ctx->bb, apr_bucket_eos_create(ctx->bb->bucket_alloc));
+
+        // set correct Content-Type and Content-Length.
+        char *cont_type = apr_psprintf(r->pool, "image/%s", of);
+        ap_set_content_type(r, cont_type);
+        ap_set_content_length(r, sled_image_finfo.size);
+#endif
+    }
 
     // end.
     gettimeofday(&t3, NULL);
