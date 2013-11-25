@@ -286,35 +286,55 @@ apr_status_t small_light_filter_imagemagick_output_data(
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "MagickSetFormat(wand, '%s')", "rgba");
         MagickSetFormat(lctx->wand, "rgba");
     } else {
+#else
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "MagickSetFormat(wand, '%s')", of);
         MagickSetFormat(lctx->wand, of);
+#endif
+#ifdef ENABLE_WEBP
     }
-#else
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-        "MagickSetFormat(wand, '%s')", of);
-    MagickSetFormat(lctx->wand, of);
 #endif
 
     // get small_lighted image as binary.
-    unsigned char *canvas_buff;
-    const char *sled_image;
-    size_t sled_image_size;
+    unsigned char *canvas_buff = NULL;
+    const char *sled_image = NULL;
+    size_t sled_image_size = 0;
     canvas_buff = MagickGetImageBlob(lctx->wand, &sled_image_size);
 #ifdef ENABLE_WEBP
     if (is_webp) {
         // convert to WebP image
         unsigned char *webp_buff = NULL;
-        size_t webp_size;
-        int stride = sled_image_size / (int)sz.dh;
-        webp_size = WebPEncodeRGBA(canvas_buff, (int)sz.dw, (int)sz.dh, stride, q, &webp_buff);
+        unsigned char *raw32 = canvas_buff;
+        const int width  = (int)sz.cw;
+        const int height = (int)sz.ch;
+        const int stride = width * 4;
+        if (sled_image_size == width * height * 8) {
+            // RRGGBBAA -> RGBA
+            sled_image_size = width * height * 4;
+            raw32 = apr_palloc(r->pool, sled_image_size);
+            size_t i;
+            for (i = 0; i < sled_image_size; ++i) {
+                raw32[i] = *((uint16_t *)(canvas_buff + i * 2)) >> 8;
+            }
+        }
+        const size_t webp_size = (q > 100.0)
+                ? WebPEncodeLosslessRGBA(raw32, width, height, stride, &webp_buff)
+                : WebPEncodeRGBA(raw32, width, height, stride, q > 0.0 ? q : 0.0, &webp_buff);
         if (webp_size == 0) {
             MagickRelinquishMemory(canvas_buff);
             small_light_filter_imagemagick_output_data_fini(ctx);
-            ap_log_rerror(
-                APLOG_MARK, APLOG_ERR, 0, r,
-                "WebPEncodeRGBA(buf, %d, %d, %d, %lf, buf) failed",
-                (int)sz.dw, (int)sz.dh, stride, q
-            );
+            if (q > 100.0) {
+                ap_log_rerror(
+                    APLOG_MARK, APLOG_ERR, 0, r,
+                    "WebPEncodeLosslessRGBA(ptr, %d, %d, %d, ptr) failed",
+                    width, height, stride
+                );
+            } else {
+                ap_log_rerror(
+                    APLOG_MARK, APLOG_ERR, 0, r,
+                    "WebPEncodeRGBA(ptr, %d, %d, %d, %lf, ptr) failed",
+                    width, height, stride, q > 0.0 ? q : 0.0
+                );
+            }
             r->status = HTTP_INTERNAL_SERVER_ERROR;
             return APR_EGENERAL;
         }
@@ -322,12 +342,12 @@ apr_status_t small_light_filter_imagemagick_output_data(
         sled_image_size = webp_size;
         free(webp_buff);
     } else {
+#else
         sled_image = (const char *)apr_pmemdup(r->pool, canvas_buff, sled_image_size);
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sled_image_size = %zd", sled_image_size);
+#endif
+#ifdef ENABLE_WEBP
     }
-#else
-    sled_image = (const char *)apr_pmemdup(r->pool, canvas_buff, sled_image_size);
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "sled_image_size = %zd", sled_image_size);
 #endif
 
     // free buffer and wand.
